@@ -48,5 +48,8 @@ func Load() (Config, error) {
 	if len(c.KafkaBrokers) == 0 {
 		return c, fmt.Errorf("KAFKA_BROKERS is empty")
 	}
+	if c.KafkaSASLEnable && (c.KafkaSASLUsername == "" || c.KafkaSASLPassword == "") {
+		return c, fmt.Errorf("KAFKA_SASL_USERNAME and KAFKA_SASL_PASSWORD must be set when SASL is enabled")
+	}
 	return c, nil
 }
