@@ -8,6 +8,7 @@ import (
 	"github.com/kelseyhightower/envconfig"
 )
 
+// Config contains values of environment variables
 type Config struct {
 	// Сетевые адреса
 	ListenAddr string `envconfig:"LISTEN_ADDR" default:":7911"`
@@ -30,6 +31,7 @@ type Config struct {
 	KafkaTLSInsecureSkipVerify bool   `envconfig:"KAFKA_TLS_INSECURE_SKIP_VERIFY" default:"false"`
 }
 
+// Load reads the environmental variables and writes them into Config
 func Load() (Config, error) {
 	// .env опционален; если файла нет — игнорируем ошибку.
 	_ = godotenv.Load()

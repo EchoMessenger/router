@@ -13,7 +13,7 @@
 Чтобы не запекать `.env` в Dockerfile смонтируем его при запуске:
 ```bash
 # сборка
-docker build -t myorg/tinode-listener:dev .
+docker buildx build --platform linux/amd64 -t ghcr.io/echomessenger/tinode-router:latest-amd64 .
 
 # локальный запуск, .env смонтируем (чтобы не печь внутрь образа)
 docker run --rm \

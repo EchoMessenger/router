@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -17,10 +19,42 @@ import (
 	"github.com/EchoMessenger/router/internal/config"
 	pbx "github.com/EchoMessenger/router/pbx"
 	"github.com/IBM/sarama"
+	"github.com/xdg-go/scram"
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 )
+
+// ---- SCRAM client generator ----
+
+var (
+	SHA256 scram.HashGeneratorFcn = sha256.New
+	SHA512 scram.HashGeneratorFcn = sha512.New
+)
+
+type XDGSCRAMClient struct {
+	*scram.Client
+	*scram.ClientConversation
+	scram.HashGeneratorFcn
+}
+
+func (x *XDGSCRAMClient) Begin(userName, password, authzID string) (err error) {
+	x.Client, err = x.HashGeneratorFcn.NewClient(userName, password, authzID)
+	if err != nil {
+		return err
+	}
+	x.ClientConversation = x.Client.NewConversation()
+	return nil
+}
+
+func (x *XDGSCRAMClient) Step(challenge string) (response string, err error) {
+	response, err = x.ClientConversation.Step(challenge)
+	return
+}
+
+func (x *XDGSCRAMClient) Done() bool {
+	return x.ClientConversation.Done()
+}
 
 // ---- Kafka wrapper ----
 
@@ -99,7 +133,7 @@ func (s *pluginServer) FireHose(ctx context.Context, in *pbx.ClientReq) (*pbx.Se
 	if in != nil {
 		key := in.GetSess().GetUserId()
 		val, _ := proto.Marshal(in)
-		s.kafka.send("client_req", key, val)
+		s.kafka.send("client-req", key, val)
 	}
 	return &pbx.ServerResp{Status: pbx.RespCode_CONTINUE}, nil
 }
@@ -114,7 +148,7 @@ func (s *pluginServer) Account(ctx context.Context, in *pbx.AccountEvent) (*pbx.
 	}
 	key := in.GetUserId()
 	val, _ := proto.Marshal(in)
-	s.kafka.send("account_events", key, val)
+	s.kafka.send("account-events", key, val)
 	return &pbx.Unused{}, nil
 }
 
@@ -124,7 +158,7 @@ func (s *pluginServer) Topic(ctx context.Context, in *pbx.TopicEvent) (*pbx.Unus
 	}
 	key := in.GetName()
 	val, _ := proto.Marshal(in)
-	s.kafka.send("topic_events", key, val)
+	s.kafka.send("topic-events", key, val)
 	return &pbx.Unused{}, nil
 }
 
@@ -134,7 +168,7 @@ func (s *pluginServer) Subscription(ctx context.Context, in *pbx.SubscriptionEve
 	}
 	key := fmt.Sprintf("%s:%s", in.GetTopic(), in.GetUserId())
 	val, _ := proto.Marshal(in)
-	s.kafka.send("subscription_events", key, val)
+	s.kafka.send("subscription-events", key, val)
 	return &pbx.Unused{}, nil
 }
 
@@ -144,7 +178,7 @@ func (s *pluginServer) Message(ctx context.Context, in *pbx.MessageEvent) (*pbx.
 	}
 	key := "message"
 	val, _ := proto.Marshal(in)
-	s.kafka.send("message_events", key, val)
+	s.kafka.send("message-events", key, val)
 	return &pbx.Unused{}, nil
 }
 
@@ -186,11 +220,15 @@ func main() {
 			case "PLAIN":
 				sc.Net.SASL.Mechanism = sarama.SASLTypePlaintext
 			case "SCRAM-SHA-256":
-				// Для SCRAM понадобятся дополнительные зависимости и генератор клиента.
-				// См. комментарий ниже в этом файле ответа.
 				sc.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
+				sc.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+					return &XDGSCRAMClient{HashGeneratorFcn: SHA256}
+				}
 			case "SCRAM-SHA-512":
 				sc.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
+				sc.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+					return &XDGSCRAMClient{HashGeneratorFcn: SHA512}
+				}
 			default:
 				log.Warn("unknown SASL mechanism, fallback to PLAIN", "mech", cfg.KafkaSASLMechanism)
 				sc.Net.SASL.Mechanism = sarama.SASLTypePlaintext

@@ -4,8 +4,14 @@ go 1.24
 
 require (
 	github.com/IBM/sarama v1.45.1
+	github.com/xdg-go/scram v1.1.2
 	google.golang.org/grpc v1.64.0
 	google.golang.org/protobuf v1.34.2
+)
+
+require (
+	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
+	github.com/xdg-go/stringprep v1.0.4 // indirect
 )
 
 require (
