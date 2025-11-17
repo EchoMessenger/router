@@ -133,7 +133,7 @@ func (s *pluginServer) FireHose(ctx context.Context, in *pbx.ClientReq) (*pbx.Se
 	if in != nil {
 		key := in.GetSess().GetUserId()
 		val, _ := proto.Marshal(in)
-		s.kafka.send("client-req", key, val)
+		s.kafka.send("client_req", key, val)
 	}
 	return &pbx.ServerResp{Status: pbx.RespCode_CONTINUE}, nil
 }
@@ -148,7 +148,7 @@ func (s *pluginServer) Account(ctx context.Context, in *pbx.AccountEvent) (*pbx.
 	}
 	key := in.GetUserId()
 	val, _ := proto.Marshal(in)
-	s.kafka.send("account-events", key, val)
+	s.kafka.send("account_events", key, val)
 	return &pbx.Unused{}, nil
 }
 
@@ -158,7 +158,7 @@ func (s *pluginServer) Topic(ctx context.Context, in *pbx.TopicEvent) (*pbx.Unus
 	}
 	key := in.GetName()
 	val, _ := proto.Marshal(in)
-	s.kafka.send("topic-events", key, val)
+	s.kafka.send("topic_events", key, val)
 	return &pbx.Unused{}, nil
 }
 
@@ -168,7 +168,7 @@ func (s *pluginServer) Subscription(ctx context.Context, in *pbx.SubscriptionEve
 	}
 	key := fmt.Sprintf("%s:%s", in.GetTopic(), in.GetUserId())
 	val, _ := proto.Marshal(in)
-	s.kafka.send("subscription-events", key, val)
+	s.kafka.send("subscription_events", key, val)
 	return &pbx.Unused{}, nil
 }
 
@@ -178,7 +178,7 @@ func (s *pluginServer) Message(ctx context.Context, in *pbx.MessageEvent) (*pbx.
 	}
 	key := "message"
 	val, _ := proto.Marshal(in)
-	s.kafka.send("message-events", key, val)
+	s.kafka.send("message_events", key, val)
 	return &pbx.Unused{}, nil
 }
 
