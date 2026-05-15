@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -96,6 +97,11 @@ type Kafka struct {
 	sentCount  atomic.Int64
 	ackCount   atomic.Int64
 	errorCount atomic.Int64
+}
+
+type kafkaSink interface {
+	send(topic, key string, value []byte) error
+	sendToDLQ(key string, value []byte, reason string)
 }
 
 func newKafka(brokers []string, clientID, prefix string, log *slog.Logger, tune func(*sarama.Config)) (*Kafka, error) {
@@ -284,7 +290,7 @@ func getClientAddr(ctx context.Context) string {
 
 type pluginServer struct {
 	pbx.UnimplementedPluginServer
-	kafka     *Kafka
+	kafka     kafkaSink
 	log       *slog.Logger
 	startTime time.Time
 
@@ -642,30 +648,155 @@ func loggingInterceptor(log *slog.Logger) grpc.UnaryServerInterceptor {
 	}
 }
 
+func logLevel(value string) slog.Level {
+	switch strings.ToLower(value) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
+func configureKafkaSecurity(sc *sarama.Config, cfg config.Config, log *slog.Logger) {
+	if cfg.KafkaTLSEnable {
+		log.Info("kafka.tls.enabled")
+		sc.Net.TLS.Enable = true
+		sc.Net.TLS.Config = &tls.Config{
+			InsecureSkipVerify: cfg.KafkaTLSInsecureSkipVerify,
+		}
+	}
+	if cfg.KafkaSASLEnable {
+		log.Info("kafka.sasl.enabled",
+			"mechanism", cfg.KafkaSASLMechanism,
+			"user", cfg.KafkaSASLUsername,
+		)
+		sc.Net.SASL.Enable = true
+		sc.Net.SASL.User = cfg.KafkaSASLUsername
+		sc.Net.SASL.Password = cfg.KafkaSASLPassword
+
+		switch strings.ToUpper(cfg.KafkaSASLMechanism) {
+		case "PLAIN":
+			sc.Net.SASL.Mechanism = sarama.SASLTypePlaintext
+		case "SCRAM-SHA-256":
+			sc.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
+			sc.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+				return &XDGSCRAMClient{HashGeneratorFcn: SHA256}
+			}
+		case "SCRAM-SHA-512":
+			sc.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
+			sc.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+				return &XDGSCRAMClient{HashGeneratorFcn: SHA512}
+			}
+		default:
+			log.Warn("kafka.sasl.unknown_mechanism",
+				"mechanism", cfg.KafkaSASLMechanism,
+				"fallback", "PLAIN",
+			)
+			sc.Net.SASL.Mechanism = sarama.SASLTypePlaintext
+		}
+	}
+}
+
+func newHealthMux(k *Kafka, pluginSrv *pluginServer, startTime time.Time) *http.ServeMux {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
+		sent := k.sentCount.Load()
+		acks := k.ackCount.Load()
+		errs := k.errorCount.Load()
+
+		stats := fmt.Sprintf(`{
+  "uptime_seconds": %d,
+  "kafka": {
+    "sent": %d,
+    "acks": %d,
+    "errors": %d,
+    "pending": %d
+  },
+  "grpc": {
+    "firehose_calls": %d,
+    "find_calls": %d,
+    "account_calls": %d,
+    "topic_calls": %d,
+    "subscription_calls": %d,
+    "message_calls": %d
+  }
+}`,
+			int(time.Since(startTime).Seconds()),
+			sent, acks, errs, sent-acks-errs,
+			pluginSrv.fireHoseCount.Load(),
+			pluginSrv.findCount.Load(),
+			pluginSrv.accountCount.Load(),
+			pluginSrv.topicCount.Load(),
+			pluginSrv.subscriptionCount.Load(),
+			pluginSrv.messageCount.Load(),
+		)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(stats))
+	})
+
+	return mux
+}
+
+type appDeps struct {
+	loadConfig     func() (config.Config, error)
+	newKafka       func([]string, string, string, *slog.Logger, func(*sarama.Config)) (*Kafka, error)
+	listen         func(string, string) (net.Listener, error)
+	serveGRPC      func(*grpc.Server, net.Listener) error
+	listenAndServe func(string, http.Handler) error
+	notify         func(chan<- os.Signal, ...os.Signal)
+	exit           func(int)
+	logWriter      io.Writer
+}
+
+func defaultAppDeps() appDeps {
+	return appDeps{
+		loadConfig:     config.Load,
+		newKafka:       newKafka,
+		listen:         net.Listen,
+		serveGRPC:      func(s *grpc.Server, l net.Listener) error { return s.Serve(l) },
+		listenAndServe: http.ListenAndServe,
+		notify:         signal.Notify,
+		exit:           os.Exit,
+		logWriter:      os.Stdout,
+	}
+}
+
 // ============================================================
 // main
 // ============================================================
 
 func main() {
-	startTime := time.Now()
-
-	cfg, err := config.Load()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "config load failed: %v\n", err)
+	if err := runApp(defaultAppDeps()); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
+}
 
-	level := slog.LevelInfo
-	switch strings.ToLower(cfg.LogLevel) {
-	case "debug":
-		level = slog.LevelDebug
-	case "warn", "warning":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
+func runApp(deps appDeps) error {
+	startTime := time.Now()
+
+	cfg, err := deps.loadConfig()
+	if err != nil {
+		return fmt.Errorf("config load failed: %w", err)
 	}
 
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+	level := logLevel(cfg.LogLevel)
+
+	if deps.logWriter == nil {
+		deps.logWriter = io.Discard
+	}
+	log := slog.New(slog.NewJSONHandler(deps.logWriter, &slog.HandlerOptions{
 		Level: level,
 	}))
 	slog.SetDefault(log)
@@ -683,48 +814,12 @@ func main() {
 		"kafka_sasl_user", cfg.KafkaSASLUsername,
 	)
 
-	k, err := newKafka(cfg.KafkaBrokers, cfg.KafkaClientID, cfg.TopicPrefix, log, func(sc *sarama.Config) {
-		if cfg.KafkaTLSEnable {
-			log.Info("kafka.tls.enabled")
-			sc.Net.TLS.Enable = true
-			sc.Net.TLS.Config = &tls.Config{
-				InsecureSkipVerify: cfg.KafkaTLSInsecureSkipVerify,
-			}
-		}
-		if cfg.KafkaSASLEnable {
-			log.Info("kafka.sasl.enabled",
-				"mechanism", cfg.KafkaSASLMechanism,
-				"user", cfg.KafkaSASLUsername,
-			)
-			sc.Net.SASL.Enable = true
-			sc.Net.SASL.User = cfg.KafkaSASLUsername
-			sc.Net.SASL.Password = cfg.KafkaSASLPassword
-
-			switch strings.ToUpper(cfg.KafkaSASLMechanism) {
-			case "PLAIN":
-				sc.Net.SASL.Mechanism = sarama.SASLTypePlaintext
-			case "SCRAM-SHA-256":
-				sc.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
-				sc.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
-					return &XDGSCRAMClient{HashGeneratorFcn: SHA256}
-				}
-			case "SCRAM-SHA-512":
-				sc.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
-				sc.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
-					return &XDGSCRAMClient{HashGeneratorFcn: SHA512}
-				}
-			default:
-				log.Warn("kafka.sasl.unknown_mechanism",
-					"mechanism", cfg.KafkaSASLMechanism,
-					"fallback", "PLAIN",
-				)
-				sc.Net.SASL.Mechanism = sarama.SASLTypePlaintext
-			}
-		}
+	k, err := deps.newKafka(cfg.KafkaBrokers, cfg.KafkaClientID, cfg.TopicPrefix, log, func(sc *sarama.Config) {
+		configureKafkaSecurity(sc, cfg, log)
 	})
 	if err != nil {
 		log.Error("kafka.init.fatal", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("kafka init failed: %w", err)
 	}
 
 	grpcServer := grpc.NewServer(
@@ -738,68 +833,25 @@ func main() {
 	}
 	pbx.RegisterPluginServer(grpcServer, pluginSrv)
 
-	listener, err := net.Listen("tcp", cfg.ListenAddr)
+	listener, err := deps.listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		log.Error("grpc.listen.failed", "addr", cfg.ListenAddr, "err", err)
-		os.Exit(1)
+		return fmt.Errorf("grpc listen failed: %w", err)
 	}
 
 	log.Info("grpc.listen.ok", "addr", cfg.ListenAddr)
 
 	go func() {
-		if err := grpcServer.Serve(listener); err != nil {
+		if err := deps.serveGRPC(grpcServer, listener); err != nil {
 			log.Error("grpc.serve.failed", "err", err)
-			os.Exit(1)
+			deps.exit(1)
 		}
 	}()
 
 	// Health + stats HTTP
 	go func() {
-		mux := http.NewServeMux()
-
-		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ok"))
-		})
-
-		mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
-			sent := k.sentCount.Load()
-			acks := k.ackCount.Load()
-			errs := k.errorCount.Load()
-
-			stats := fmt.Sprintf(`{
-  "uptime_seconds": %d,
-  "kafka": {
-    "sent": %d,
-    "acks": %d,
-    "errors": %d,
-    "pending": %d
-  },
-  "grpc": {
-    "firehose_calls": %d,
-    "find_calls": %d,
-    "account_calls": %d,
-    "topic_calls": %d,
-    "subscription_calls": %d,
-    "message_calls": %d
-  }
-}`,
-				int(time.Since(startTime).Seconds()),
-				sent, acks, errs, sent-acks-errs,
-				pluginSrv.fireHoseCount.Load(),
-				pluginSrv.findCount.Load(),
-				pluginSrv.accountCount.Load(),
-				pluginSrv.topicCount.Load(),
-				pluginSrv.subscriptionCount.Load(),
-				pluginSrv.messageCount.Load(),
-			)
-
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(stats))
-		})
-
 		log.Info("health.listen.ok", "addr", cfg.HealthAddr)
-		if err := http.ListenAndServe(cfg.HealthAddr, mux); err != nil {
+		if err := deps.listenAndServe(cfg.HealthAddr, newHealthMux(k, pluginSrv, startTime)); err != nil {
 			log.Error("health.serve.failed", "err", err)
 		}
 	}()
@@ -836,7 +888,7 @@ func main() {
 
 	// Graceful shutdown
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	deps.notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	received := <-sig
 
 	log.Info("service.shutdown.start", "signal", received.String())
@@ -856,4 +908,5 @@ func main() {
 		"kafka_acks", k.ackCount.Load(),
 		"kafka_errors", k.errorCount.Load(),
 	)
+	return nil
 }
