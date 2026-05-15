@@ -1,0 +1,46 @@
+name: SonarQube
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  sonar:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Generate coverage report
+        run: |
+          if find . -name '*_test.go' -print -quit | grep -q .; then
+            go test ./... -coverprofile=coverage.out
+          else
+            echo "mode: set" > coverage.out
+          fi
+
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          projectBaseDir: .
+          args: >
+            -Dsonar.projectKey=router
+            -Dsonar.projectName=router
+            -Dsonar.go.coverage.reportPaths=coverage.out

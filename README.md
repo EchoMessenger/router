@@ -4,6 +4,13 @@
 
 Пример `.env` находится в `./.env.example`
 
+## GitHub Actions SonarQube
+
+Для workflow `/.github/workflows/sonar.yml` нужны:
+- `secrets.SONAR_HOST_URL`
+- `secrets.SONAR_TOKEN`
+- `vars.SONAR_PROJECT_KEY_ROUTER`
+
 ## Инструкция по запуску
 
 Создать `.env` по примеру `./.env.example` и положить в корень проекта
@@ -25,4 +32,3 @@ docker run --rm \
 ### Compose
 
 Указываем env_file: .env у сервиса
-
