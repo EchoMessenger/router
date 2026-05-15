@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -806,5 +807,150 @@ func TestPluginMessageSendsToDLQOnError(t *testing.T) {
 	}
 	if len(k.dlq) != 1 {
 		t.Fatalf("dlq = %d, want 1", len(k.dlq))
+	}
+}
+
+func TestKafkaPrefixTrimming(t *testing.T) {
+	prod := newFakeAsyncProducer()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"tinode.", "tinode"},
+		{"tinode", "tinode"},
+		{"test.", "test"},
+		{"", ""},
+		{"test..", "test."},
+	}
+
+	for _, tt := range tests {
+		t.Run("prefix_"+tt.input, func(t *testing.T) {
+			k := &Kafka{
+				prod:   prod,
+				prefix: strings.TrimSuffix(tt.input, "."),
+				log:    logger,
+			}
+			if k.prefix != tt.want {
+				t.Fatalf("prefix = %q, want %q", k.prefix, tt.want)
+			}
+		})
+	}
+}
+
+func TestKafkaInitializesWithCorrectConfig(t *testing.T) {
+	prod := newFakeAsyncProducer()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	k := &Kafka{
+		prod:   prod,
+		prefix: "tinode",
+		log:    logger,
+	}
+
+	if k.sentCount.Load() != 0 {
+		t.Fatalf("sentCount = %d, want 0", k.sentCount.Load())
+	}
+	if k.ackCount.Load() != 0 {
+		t.Fatalf("ackCount = %d, want 0", k.ackCount.Load())
+	}
+	if k.errorCount.Load() != 0 {
+		t.Fatalf("errorCount = %d, want 0", k.errorCount.Load())
+	}
+	if k.prefix != "tinode" {
+		t.Fatalf("prefix = %q, want tinode", k.prefix)
+	}
+}
+
+func TestKafkaSendToMultipleTopics(t *testing.T) {
+	prod := newFakeAsyncProducer()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	k := &Kafka{
+		prod:   prod,
+		prefix: "tinode",
+		log:    logger,
+	}
+
+	topics := []string{"account-events", "message-events", "topic-events"}
+	for _, topic := range topics {
+		expected := "tinode." + topic
+		got := k.topic(topic)
+		if got != expected {
+			t.Fatalf("topic(%s) = %q, want %q", topic, got, expected)
+		}
+	}
+
+	if k.topic("dlq") != "tinode.dlq" {
+		t.Fatalf("topic(dlq) failed")
+	}
+}
+
+func TestKafkaSendDLQWithReason(t *testing.T) {
+	prod := newFakeAsyncProducer()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	k := &Kafka{
+		prod:   prod,
+		prefix: "tinode",
+		log:    logger,
+	}
+
+	k.sendToDLQ("key1", []byte("failed_data"), "connection timeout")
+
+	if k.sentCount.Load() != 1 {
+		t.Fatalf("sentCount = %d, want 1", k.sentCount.Load())
+	}
+
+	msg := <-prod.input
+	if msg.Topic != "tinode.dlq" {
+		t.Fatalf("topic = %q, want tinode.dlq", msg.Topic)
+	}
+}
+
+func TestKafkaTopicWithoutPrefix(t *testing.T) {
+	prod := newFakeAsyncProducer()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	k := &Kafka{
+		prod:   prod,
+		prefix: "",
+		log:    logger,
+	}
+
+	fullTopic := k.topic("message-events")
+	if fullTopic != "message-events" {
+		t.Fatalf("topic = %q, want message-events", fullTopic)
+	}
+}
+
+func TestKafkaTracksStatistics(t *testing.T) {
+	prod := newFakeAsyncProducer()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	k := &Kafka{
+		prod:   prod,
+		prefix: "test",
+		log:    logger,
+	}
+
+	k.sentCount.Store(100)
+	k.ackCount.Store(80)
+	k.errorCount.Store(5)
+
+	if k.sentCount.Load() != 100 {
+		t.Fatalf("sentCount = %d, want 100", k.sentCount.Load())
+	}
+	if k.ackCount.Load() != 80 {
+		t.Fatalf("ackCount = %d, want 80", k.ackCount.Load())
+	}
+	if k.errorCount.Load() != 5 {
+		t.Fatalf("errorCount = %d, want 5", k.errorCount.Load())
+	}
+
+	pending := k.sentCount.Load() - k.ackCount.Load() - k.errorCount.Load()
+	if pending != 15 {
+		t.Fatalf("pending = %d, want 15", pending)
 	}
 }
