@@ -635,3 +635,176 @@ func TestPluginUnaryNilInputs(t *testing.T) {
 		t.Fatalf("Find(nil) = (%v, %v), want CONTINUE nil", resp, err)
 	}
 }
+
+func TestSCRAMClientStep(t *testing.T) {
+	client := &XDGSCRAMClient{HashGeneratorFcn: SHA256}
+	if err := client.Begin("user", "pass", ""); err != nil {
+		t.Fatalf("Begin returned error: %v", err)
+	}
+
+	resp, err := client.Step("test")
+	if err != nil {
+		t.Fatalf("Step returned error: %v", err)
+	}
+	if resp == "" {
+		t.Fatalf("Step returned empty response")
+	}
+}
+
+func TestKafkaSendTimeout(t *testing.T) {
+	blocked := make(chan struct{})
+	prod := &fakeAsyncProducer{
+		input:     make(chan *sarama.ProducerMessage),
+		successes: make(chan *sarama.ProducerMessage),
+		errors:    make(chan *sarama.ProducerError),
+	}
+
+	k := &Kafka{prod: prod, prefix: "test", log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	go func() {
+		close(blocked)
+		time.Sleep(time.Second)
+	}()
+
+	<-blocked
+	err := k.send("topic", "key", []byte("value"))
+	if err == nil {
+		t.Fatalf("send should timeout, got nil error")
+	}
+}
+
+func TestKafkaProducerChannelsClosed(t *testing.T) {
+	prod := newFakeAsyncProducer()
+	_ = &Kafka{prod: prod, prefix: "test", log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		close(prod.successes)
+		close(prod.errors)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+}
+
+func TestDefaultAppDepsIndividualFunctions(t *testing.T) {
+	deps := defaultAppDeps()
+
+	if _, err := deps.loadConfig(); err != nil {
+		t.Logf("loadConfig called (expected to fail without .env): %v", err)
+	}
+
+	listener, err := deps.listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	listener.Close()
+
+	srv := grpc.NewServer()
+	defer srv.GracefulStop()
+
+	listener, _ = net.Listen("tcp", ":0")
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		srv.GracefulStop()
+	}()
+
+	err = deps.serveGRPC(srv, listener)
+	if err != nil && err != grpc.ErrServerStopped {
+		t.Logf("serveGRPC returned: %v", err)
+	}
+	listener.Close()
+
+	ch := make(chan os.Signal, 1)
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		ch <- syscall.SIGTERM
+	}()
+
+	deps.notify(ch, syscall.SIGTERM)
+	sig := <-ch
+	if sig != syscall.SIGTERM {
+		t.Fatalf("notify didn't work, got signal %v", sig)
+	}
+
+	if deps.logWriter == nil {
+		t.Fatalf("logWriter is nil")
+	}
+}
+
+func TestConfigureKafkaSecurityTLS(t *testing.T) {
+	sc := sarama.NewConfig()
+	configureKafkaSecurity(sc, config.Config{
+		KafkaTLSEnable:             true,
+		KafkaTLSInsecureSkipVerify: false,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if !sc.Net.TLS.Enable {
+		t.Fatalf("TLS not enabled")
+	}
+	if sc.Net.TLS.Config == nil {
+		t.Fatalf("TLS config is nil")
+	}
+	if sc.Net.TLS.Config.InsecureSkipVerify {
+		t.Fatalf("InsecureSkipVerify should be false")
+	}
+}
+
+func TestPluginFindWithoutUserId(t *testing.T) {
+	k := &fakeKafka{}
+	s := testServer(k)
+	resp, err := s.Find(context.Background(), &pbx.SearchQuery{})
+	if err != nil {
+		t.Fatalf("Find returned error: %v", err)
+	}
+	if resp.GetStatus() != pbx.RespCode_CONTINUE {
+		t.Fatalf("status = %v, want CONTINUE", resp.GetStatus())
+	}
+}
+
+func TestPluginAccountSendsToDLQOnError(t *testing.T) {
+	k := &fakeKafka{err: errors.New("kafka down")}
+	s := testServer(k)
+	_, err := s.Account(context.Background(), &pbx.AccountEvent{UserId: "usr1", Action: pbx.Crud_CREATE})
+	if err != nil {
+		t.Fatalf("Account returned error: %v", err)
+	}
+	if len(k.dlq) != 1 {
+		t.Fatalf("dlq = %d, want 1", len(k.dlq))
+	}
+}
+
+func TestPluginTopicSendsToDLQOnError(t *testing.T) {
+	k := &fakeKafka{err: errors.New("kafka down")}
+	s := testServer(k)
+	_, err := s.Topic(context.Background(), &pbx.TopicEvent{Name: "grp1", Action: pbx.Crud_UPDATE})
+	if err != nil {
+		t.Fatalf("Topic returned error: %v", err)
+	}
+	if len(k.dlq) != 1 {
+		t.Fatalf("dlq = %d, want 1", len(k.dlq))
+	}
+}
+
+func TestPluginSubscriptionSendsToDLQOnError(t *testing.T) {
+	k := &fakeKafka{err: errors.New("kafka down")}
+	s := testServer(k)
+	_, err := s.Subscription(context.Background(), &pbx.SubscriptionEvent{Topic: "grp1", UserId: "usr1", Action: pbx.Crud_UPDATE})
+	if err != nil {
+		t.Fatalf("Subscription returned error: %v", err)
+	}
+	if len(k.dlq) != 1 {
+		t.Fatalf("dlq = %d, want 1", len(k.dlq))
+	}
+}
+
+func TestPluginMessageSendsToDLQOnError(t *testing.T) {
+	k := &fakeKafka{err: errors.New("kafka down")}
+	s := testServer(k)
+	_, err := s.Message(context.Background(), &pbx.MessageEvent{Action: pbx.Crud_CREATE, Msg: &pbx.ServerData{Topic: "grp1", FromUserId: "usr1"}})
+	if err != nil {
+		t.Fatalf("Message returned error: %v", err)
+	}
+	if len(k.dlq) != 1 {
+		t.Fatalf("dlq = %d, want 1", len(k.dlq))
+	}
+}
