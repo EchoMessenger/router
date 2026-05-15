@@ -44,3 +44,5 @@ jobs:
             -Dsonar.projectKey=router
             -Dsonar.projectName=router
             -Dsonar.go.coverage.reportPaths=coverage.out
+            -Dsonar.exclusions=pbx/**,proto/**
+            -Dsonar.coverage.exclusions=pbx/**,proto/**
